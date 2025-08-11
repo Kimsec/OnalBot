@@ -20,14 +20,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # Secrets and configuration from environment variables
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-LAVALINK_URI = os.getenv("LAVALINK_URI", "http://127.0.0.1:2333")
-LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "")
-FONT_PATH = os.getenv("FONT_PATH", os.path.join(BASE_DIR, "arial.ttf"))
-ALLOWED_GUILD_IDS_ENV = os.getenv("ALLOWED_GUILD_IDS", "214461949574905857,1064940616208883792")
-ALLOWED_GUILD_IDS = []
+DISCORD_TOKEN           = os.getenv("DISCORD_TOKEN")
+SPOTIFY_CLIENT_ID       = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET   = os.getenv("SPOTIFY_CLIENT_SECRET")
+LAVALINK_URI            = os.getenv("LAVALINK_URI")
+LAVALINK_PASSWORD       = os.getenv("LAVALINK_PASSWORD")
+FONT_PATH               = os.getenv("FONT_PATH", os.path.join(BASE_DIR, "arial.ttf"))
+ALLOWED_GUILD_IDS_ENV   = os.getenv("ALLOWED_GUILD_IDS")
+ALLOWED_GUILD_IDS       = []
 for part in ALLOWED_GUILD_IDS_ENV.split(','):
     part = part.strip()
     if part.isdigit():
