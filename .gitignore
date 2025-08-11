@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data
+.env
+music_cache.db
+*.log
+
+# Byte-compiled / optimized / DLL files
+build/
+dist/
+*.egg-info/

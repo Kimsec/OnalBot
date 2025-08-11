@@ -1,0 +1,8 @@
+discord.py
+pillow
+requests
+spotipy
+PyNaCl
+wavelink
+aiosqlite
+python-dotenv
