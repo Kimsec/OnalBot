@@ -58,17 +58,6 @@ python OnalBot.py
 - Ensure `.env` and `music_cache.db` are ignored by `.gitignore`.
 - Initialize git and push to a new GitHub repo:
 
-```pwsh
-git init
-git add .
-# Optional: ensure the .env file is NOT added
-git reset .env
-git commit -m "Initial commit: OnalBot with env-based config"
-# Create a repo on GitHub first, then add the remote:
-# git remote add origin https://github.com/<user>/<repo>.git
-# git branch -M main
-# git push -u origin main
-```
 
 ## Notes
 
