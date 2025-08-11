@@ -20,6 +20,7 @@ Thumbs.db
 # Local data
 .env
 music_cache.db
+run.sh
 *.log
 
 # Byte-compiled / optimized / DLL files
