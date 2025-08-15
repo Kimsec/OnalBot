@@ -7,13 +7,15 @@
 <br><p align="center" width="100%">
 <a href="https://www.buymeacoffee.com/kimsec">
   <img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&amp;emoji=%E2%98%95&amp;slug=kimsec&amp;button_colour=FFDD00&amp;font_colour=000000&amp;font_family=Inter&amp;outline_colour=000000&amp;coffee_colour=ffffff" alt="Buy Me A Coffee"></a></p>
-
 <p align="center">
-  <a href="https://github.com/kimsec/OnalBot/releases/latest">
+    <a href="https://github.com/Kimsec/OnalBot">
+    <img src="https://img.shields.io/badge/Platform-Self%20Hosted-success" alt="Self Hosted"></a>
+    <a href="https://github.com/kimsec/OnalBot/releases/latest">
     <img src="https://img.shields.io/badge/Download-OnalBot-blue" alt="Download Badge" style="margin-right: 10px;"></a>
     <a href="https://github.com/Kimsec/OnalBot/releases">
     <img src="https://img.shields.io/github/v/release/kimsec/OnalBot" alt="Release Badge" style="margin-right: 0px;"></a>
 </p>
+
 
 
 # Description
