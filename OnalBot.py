@@ -25,8 +25,11 @@ SPOTIFY_CLIENT_ID       = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET   = os.getenv("SPOTIFY_CLIENT_SECRET")
 LAVALINK_URI            = os.getenv("LAVALINK_URI")
 LAVALINK_PASSWORD       = os.getenv("LAVALINK_PASSWORD")
+LAVALINK_RESUME_KEY     = os.getenv("LAVALINK_RESUME_KEY", "onalbot-session")
+LAVALINK_RESUME_TIMEOUT = int(os.getenv("LAVALINK_RESUME_TIMEOUT", "120"))  # sekunder
 FONT_PATH               = os.getenv("FONT_PATH", os.path.join(BASE_DIR, "arial.ttf"))
 ALLOWED_GUILD_IDS_ENV   = os.getenv("ALLOWED_GUILD_IDS")
+APPLE_MUSIC_COUNTRY     = os.getenv("APPLE_MUSIC_COUNTRY", "NO")  # Default landkode for Apple Music lookup
 ALLOWED_GUILD_IDS       = []
 for part in ALLOWED_GUILD_IDS_ENV.split(','):
     part = part.strip()
@@ -44,6 +47,102 @@ if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
         print(f"Spotify init error: {e}")
 DB_PATH = os.path.join(BASE_DIR, "music_cache.db")
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+
+# ------------------------------------------------------
+# Lavalink connection helpers (auto reconnect + heartbeat)
+# ------------------------------------------------------
+_lavalink_reconnect_lock = asyncio.Lock()
+_last_lavalink_ok = 0.0
+
+
+def _build_node():
+    """Attempt to build a Node with resume settings; fallback if unsupported."""
+    try:
+        return wavelink.Node(
+            uri=LAVALINK_URI,
+            password=LAVALINK_PASSWORD,
+            resume_key=LAVALINK_RESUME_KEY,
+            resume_timeout=LAVALINK_RESUME_TIMEOUT,
+        )
+    except TypeError:
+        # Older wavelink version without resume params in ctor
+        return wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
+
+
+async def connect_lavalink(retries: int = 5, delay: int = 3, backoff: float = 1.7) -> bool:
+    """Connect (or validate existing) Lavalink node with exponential backoff."""
+    global _last_lavalink_ok
+    if not LAVALINK_URI or not LAVALINK_PASSWORD:
+        print("[Lavalink] Mangler URI eller PASS i miljøvariabler.")
+        return False
+    async with _lavalink_reconnect_lock:
+        for attempt in range(1, retries + 1):
+            try:
+                # Validate existing node first
+                if wavelink.Pool.nodes:
+                    try:
+                        node = wavelink.Pool.get_node()
+                        await node.fetch_stats()
+                        _last_lavalink_ok = time.time()
+                        return True
+                    except Exception:
+                        pass  # will rebuild
+
+                print(f"[Lavalink] Koble til (forsøk {attempt}) ...")
+                node = _build_node()
+                await wavelink.Pool.connect(client=bot, nodes=[node])
+                await node.fetch_stats()  # verify
+                _last_lavalink_ok = time.time()
+                print("[Lavalink] Tilkoblet.")
+                return True
+            except Exception as e:
+                print(f"[Lavalink] Feil: {e}")
+                if attempt == retries:
+                    break
+                await asyncio.sleep(delay)
+                delay = int(delay * backoff)
+        print("[Lavalink] Klarte ikke koble til etter forsøk.")
+        return False
+
+
+async def ensure_lavalink() -> bool:
+    """Ensure Lavalink is reachable before playback."""
+    try:
+        node = wavelink.Pool.get_node()
+        await node.fetch_stats()
+        return True
+    except Exception:
+        return await connect_lavalink(retries=3, delay=2)
+
+
+async def reconnect_lavalink() -> bool:
+    """Force drop all nodes and reconnect fresh."""
+    try:
+        for node in list(getattr(wavelink.Pool, "nodes", {}).values()):
+            try:
+                await node.disconnect()
+            except Exception as e:
+                print(f"[Lavalink] Feil ved disconnect: {e}")
+    except Exception:
+        pass
+    return await connect_lavalink(retries=5, delay=2)
+
+
+@tasks.loop(seconds=30)
+async def lavalink_heartbeat():
+    try:
+        node = wavelink.Pool.get_node()
+        await node.fetch_stats()
+        global _last_lavalink_ok
+        _last_lavalink_ok = time.time()
+    except Exception as e:
+        print(f"[Lavalink] Heartbeat-feil: {e}. Forsøker reconnect ...")
+        await connect_lavalink(retries=3, delay=2)
+
+
+@lavalink_heartbeat.before_loop
+async def _before_hb():
+    await bot.wait_until_ready()
 
 @bot.check
 async def globally_block_servers(ctx):
@@ -101,6 +200,28 @@ async def set_youtube_cache(query, yt_title, yt_url):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR REPLACE INTO youtube_cache (yt_query, yt_title, yt_url) VALUES (?, ?, ?)", (query, yt_title, yt_url))
         await db.commit()
+
+
+# ----------------------------
+# Apple Music helper (bruker iTunes public lookup API)
+# Gjenbruker spotify_cache ved å lagre nøkkel 'apple:<id>' -> ytsearch...
+# ----------------------------
+async def fetch_apple_track(track_id: str, country: str) -> tuple | None:
+    """Returner (title, artist) for Apple Music track id eller None hvis ikke funnet."""
+    url = f"https://itunes.apple.com/lookup?id={track_id}&country={country}"
+    try:
+        data = await asyncio.to_thread(lambda: requests.get(url, timeout=8).json())
+        if not data or data.get("resultCount", 0) == 0:
+            return None
+        res = data["results"][0]
+        title = res.get("trackName") or res.get("collectionName")
+        artist = res.get("artistName") or ""
+        if not title:
+            return None
+        return title, artist
+    except Exception as e:
+        print(f"[AppleMusic] Lookup-feil: {e}")
+        return None
 # Global variables
 
 music_queue = []
@@ -383,11 +504,75 @@ async def play_next(ctx):
 
 @bot.command(aliases=['PLAY', 'p', 'P'])
 async def play(ctx, *, query: str):
+    # Sjekk Lavalink først – ikke join voice hvis musikkserver er nede
+    if not await ensure_lavalink():
+        await ctx.send(":x: Klarte ikke koble til musikkserver (Lavalink). Prøv igjen senere.", delete_after=6)
+        try:
+            await ctx.message.delete(delay=1)
+        except Exception:
+            pass
+        return
     if not await ensure_voice(ctx):
         return
-
     vc: wavelink.Player = ctx.voice_client
-
+    if any(domain in query for domain in ("music.youtube.com/watch", "m.youtube.com/watch")):
+        if "v=" in query:
+            vid = query.split("v=")[1].split("&")[0]
+            query = f"https://www.youtube.com/watch?v={vid}"
+    # --- Apple Music enkeltspor ---
+    if "music.apple.com" in query and "/song/" in query:
+        try:
+            # Ekstraher land og ID
+            parts = query.split('/')
+            # ID sist som er heltall
+            track_id = next((p.split('?')[0] for p in reversed(parts) if p.split('?')[0].isdigit()), None)
+            if not track_id:
+                await ctx.send(":x: Fant ikke Apple Music ID i lenken.", delete_after=5)
+                await ctx.message.delete(delay=1)
+                return
+            # Cache-nøkkel
+            cache_key = f"apple:{track_id}"
+            search = await get_spotify_cache(cache_key)  # gjenbruk tabell
+            if not search:
+                meta = await fetch_apple_track(track_id, APPLE_MUSIC_COUNTRY)
+                if not meta:
+                    await ctx.send(":x: Fant ikke Apple Music metadata.", delete_after=5)
+                    await ctx.message.delete(delay=1)
+                    return
+                title, artist = meta
+                search = f"ytsearch:{title} {artist}".strip()
+                await set_spotify_cache(cache_key, search)
+            yt_cache = await get_youtube_cache(search)
+            if yt_cache:
+                tracks = await wavelink.Pool.fetch_tracks(yt_cache[1])
+                if not tracks:
+                    yt_cache = None  # force new search
+            if not yt_cache:
+                tracks = await wavelink.Pool.fetch_tracks(search)
+                if not tracks:
+                    await ctx.send(":x: Fant ikke matchende YouTube-video.", delete_after=5)
+                    await ctx.message.delete(delay=1)
+                    return
+                track = tracks[0]
+                await set_youtube_cache(search, track.title, track.uri)
+            else:
+                track = tracks[0]
+            if not is_playing(vc):
+                vc.ctx = ctx
+                await vc.play(track)
+                await show_now_playing(track, ctx)
+            else:
+                music_queue.append(track)
+                embed = discord.Embed(title=track.title, color=2303786)
+                embed.set_author(name="Added To Queue", icon_url="https://cdn3.emoji.gg/emojis/3468-skype-music.gif")
+                embed.add_field(name="Requested by", value=ctx.author.name, inline=True)
+                embed.add_field(name="Position in queue", value=str(len(music_queue)), inline=True)
+                await ctx.send(embed=embed, delete_after=5)
+            await ctx.message.delete(delay=1)
+        except Exception as e:
+            await ctx.send(f":x: Apple Music-feil: {e}", delete_after=6)
+            await ctx.message.delete(delay=1)
+        return
     # --- Spotify: enkeltspor ---
     if "open.spotify.com/track" in query:
         try:
@@ -396,14 +581,11 @@ async def play(ctx, *, query: str):
                 await ctx.message.delete(delay=1)
                 return
             track_id = query.split("/")[-1].split("?")[0]
-
-            # Caching
             search = await get_spotify_cache(track_id)
             if not search:
                 track = sp.track(track_id)
                 search = f"ytsearch:{track['name']} {track['artists'][0]['name']}"
                 await set_spotify_cache(track_id, search)
-
             yt_cache = await get_youtube_cache(search)
             if yt_cache:
                 track = await wavelink.Pool.fetch_tracks(yt_cache[1])
@@ -419,7 +601,6 @@ async def play(ctx, *, query: str):
                     return
                 track = results[0]
                 await set_youtube_cache(search, track.title, track.uri)
-
             if not is_playing(vc):
                 vc.ctx = ctx
                 await vc.play(track)
@@ -433,7 +614,6 @@ async def play(ctx, *, query: str):
                 SongEmbed.add_field(name="Position in queue", value=f"{len(music_queue)}", inline=True)
                 await ctx.send(embed=SongEmbed, delete_after=5)
                 await ctx.message.delete(delay=1)
-
         except Exception as e:
             await ctx.send(f":x: Spotify-feil: {e}", delete_after=5)
             await ctx.message.delete(delay=1)
@@ -546,8 +726,9 @@ async def ensure_voice(ctx):
 async def on_ready():
     print(f"Logget inn som {bot.user.name}")
     await init_cache_db()
-    node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
-    await wavelink.Pool.connect(client=bot, nodes=[node])
+    await connect_lavalink()
+    if not lavalink_heartbeat.is_running():
+        lavalink_heartbeat.start()
 
 @bot.event
 async def on_wavelink_track_end(payload):
@@ -728,37 +909,35 @@ async def healthcheck(ctx):
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def reset(ctx):
-    """Full reset av botten i denne serveren."""
-    guild_id = ctx.guild.id
-
-    # Tøm kø
-    music_queue.clear()
-
-    # Stopp aktiv sang og koble fra voice channel
-    vc = ctx.voice_client
-    if vc:
-        await vc.stop()
-        await vc.disconnect()
-
-    # Fjern embed
-    embed_msg = embed_messages.get(guild_id)
-    if embed_msg:
+    """Full reset (alle voice-klienter, kø, state + ny Lavalink-tilkobling)."""
+    for vc in list(bot.voice_clients):
         try:
-            await embed_msg.delete()
-        except discord.NotFound:
+            await vc.stop()
+        except Exception:
             pass
-        embed_messages.pop(guild_id, None)
-
-    # Avslutt update-loop
-    if guild_id in update_tasks:
-        update_tasks[guild_id].cancel()
-        update_tasks.pop(guild_id, None)
-
-    # Fjern nåværende sang-data
-    track_data.pop(guild_id, None)
-    track_start_times.pop(guild_id, None)
-
-    await ctx.send("🔄 **Botten er nå resatt.**", delete_after=5)
+        try:
+            await vc.disconnect()
+        except Exception:
+            pass
+    music_queue.clear()
+    for gid, msg in list(embed_messages.items()):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        embed_messages.pop(gid, None)
+    for gid, task in list(update_tasks.items()):
+        try:
+            task.cancel()
+        except Exception:
+            pass
+        update_tasks.pop(gid, None)
+    track_data.clear()
+    track_start_times.clear()
+    await bot.change_presence(activity=None)
+    success = await reconnect_lavalink()
+    status_text = "✅ Reconnected" if success else "❌ Reconnect feilet"
+    await ctx.send(f"🔄 Full reset ferdig. {status_text}", delete_after=6)
     await ctx.message.delete(delay=1)
 
 

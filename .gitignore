@@ -22,6 +22,7 @@ Thumbs.db
 music_cache.db
 run.sh
 *.log
+.cache
 
 # Byte-compiled / optimized / DLL files
 build/
