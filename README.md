@@ -55,14 +55,9 @@ FONT_PATH=./arial.ttf
 python OnalBot.py
 ```
 
-## Publishing to GitHub
-
-- Ensure `.env` and `music_cache.db` are ignored by `.gitignore`.
-- Initialize git and push to a new GitHub repo:
-
 
 ## Notes
 
 - The bot restricts usage to guilds in `ALLOWED_GUILD_IDS`.
-- Caches Spotify->YouTube searches and YouTube direct links in `music_cache.db`.
+- Caches Spotify and Apple Music -> YouTube searches and YouTube direct links in `music_cache.db`.
 - Commands: see `!info`.
