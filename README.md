@@ -55,6 +55,9 @@ FONT_PATH=./arial.ttf
 python OnalBot.py
 ```
 
+## Auto Reconnect
+
+- Bot will automatically reconnect to lavalink if lavalink is disconnected
 
 ## Notes
 
