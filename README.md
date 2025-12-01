@@ -18,49 +18,67 @@
 
 
 
-# Description
+# What is OnalBot?
 
-A Discord music bot using discord.py and Wavelink (Lavalink), with optional Spotify lookup and a simple SQLite cache.
+OnalBot is a cozy little Discord music companion built with discord.py and Wavelink. It speaks Spotify, Apple Music, and YouTube, keeps a warm SQLite cache of your favorite searches, and sprinkles in welcome images so new members feel noticed the second they drop in.
 
-## Setup
+## Highlights
 
-1. Python 3.10+ recommended. Install dependencies:
+- Smooth Lavalink playback with queue controls, progress embeds, and interactive buttons.
+- Apple Music and Spotify lookups that fall back to YouTube when needed (and cache the result for next time).
+- Admin-friendly tools: `!reset`, cache management, and strict guild allow-listing.
+- Optional welcome cards with rounded avatars and custom fonts for that premium first impression.
 
-```pwsh
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+## What you need
 
-2. Create a `.env` file based on `.env.example` and fill in your values:
+- A Discord bot token with the proper intents enabled.
+- A running Lavalink node (local or remote) you can point the bot toward.
+- Optional Spotify credentials if you want ultra-reliable track matching.
+- An `arial.ttf` (or any font file) if you plan to enable the welcome artwork.
 
-```
-DISCORD_TOKEN=your-bot-token
-SPOTIFY_CLIENT_ID=your-client-id
-SPOTIFY_CLIENT_SECRET=your-client-secret
-LAVALINK_URI=http://192.168.1.20:2333
-LAVALINK_PASSWORD=your-password
-ALLOWED_GUILD_IDS=214461949574905857,1064940616208883792
-FONT_PATH=./arial.ttf
-```
+## Self-host in a few minutes
 
-- Spotify is optional; leave SPOTIFY_* empty to disable.
-- FONT_PATH defaults to `./arial.ttf`.
+1. **Grab the code & deps**
 
-3. Run Lavalink and ensure the URI/password match your `.env`.
+  ```pwsh
+  git clone https://github.com/Kimsec/OnalBot.git
+  cd OnalBot
+  python -m venv .venv
+  source .venv/bin/activate
+  pip install -r requirements.txt
+  ```
 
-4. Run the bot:
+2. **Create `.env`** – copy `.env.example` and fill in your details:
 
-```pwsh
-python OnalBot.py
-```
+  ```env
+  DISCORD_TOKEN=your-token
+  LAVALINK_URI=http://localhost:2333
+  LAVALINK_PASSWORD=supersecret
+  ALLOWED_GUILD_IDS=123456789012345678
+  SPOTIFY_CLIENT_ID=
+  SPOTIFY_CLIENT_SECRET=
+  ```
 
-## Auto Reconnect
+3. **Point to Lavalink** – make sure your Lavalink server is up and the URI/password match.
 
-- Bot will automatically reconnect to lavalink if lavalink is disconnected
+4. **Run the bot**
 
-## Notes
+  ```pwsh
+  python OnalBot.py
+  ```
 
-- The bot restricts usage to guilds in `ALLOWED_GUILD_IDS`.
-- Caches Spotify and Apple Music -> YouTube searches and YouTube direct links in `music_cache.db`.
-- Commands: see `!info`.
+## Hosting tips
+
+- Running on Linux? Drop it into a `systemd` service and enable auto-restart so `!reset` + service restarts keep everything tidy.
+- Want headless Lavalink + bot on the same box? Use a reverse proxy or firewall rules so only you can reach Lavalink’s port.
+- Keep `.env` outside version control and rotate secrets whenever you rotate Discord/Lavalink credentials.
+
+## Commands at a glance
+
+- `!play` / `!p` — play a track, Apple Music link, Spotify URL, or plain search.
+- `!queue`, `!remove`, `!prioritize`, `!shuffle` — manage what’s coming up next.
+- `!clearqueue`, `!stop`, `!reset` — clean slate when you need it.
+- `!showcache`, `!clearcache`, `!healthcheck` — keep an eye on the bot’s internals.
+- `!info`, `!music` — share a command overview with your server.
+
+Sit back, drop a `!p miley cyrus flowers`, and let OnalBot set the vibe. 🌸
