@@ -2,12 +2,11 @@ import discord
 from discord.ext import commands
 from discord.ext.commands import CommandNotFound, CheckFailure
 import wavelink
-from wavelink import Node, Player, Playlist
+from wavelink import Playlist
 import asyncio
 import time
 import math
 import os
-from discord.ui import View
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import requests
@@ -31,11 +30,13 @@ FONT_PATH               = os.getenv("FONT_PATH", os.path.join(BASE_DIR, "arial.t
 ALLOWED_GUILD_IDS_ENV   = os.getenv("ALLOWED_GUILD_IDS")
 APPLE_MUSIC_COUNTRY     = os.getenv("APPLE_MUSIC_COUNTRY", "NO")  # Default landkode for Apple Music lookup
 WELCOME_GUILD_ID        = int(os.getenv("WELCOME_GUILD_ID", "0"))  # Kun denne serveren får welcome-bilde (0 = deaktivert)
+PAUSE_DISCONNECT_TIMEOUT = int(os.getenv("PAUSE_DISCONNECT_TIMEOUT", "3600"))  # sekunder pauset før auto-stop
 ALLOWED_GUILD_IDS       = []
-for part in ALLOWED_GUILD_IDS_ENV.split(','):
-    part = part.strip()
-    if part.isdigit():
-        ALLOWED_GUILD_IDS.append(int(part))
+if ALLOWED_GUILD_IDS_ENV:
+    for part in ALLOWED_GUILD_IDS_ENV.split(','):
+        part = part.strip()
+        if part.isdigit():
+            ALLOWED_GUILD_IDS.append(int(part))
 
 sp = None
 if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
@@ -51,7 +52,7 @@ bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
 
 
 def _build_node():
-    """Build a Node with resume settings if supported."""
+    # Build a Node with resume settings if supported
     try:
         return wavelink.Node(
             uri=LAVALINK_URI,
@@ -64,24 +65,17 @@ def _build_node():
 
 
 async def connect_lavalink() -> bool:
-    """Single-attempt Lavalink connection (no auto-retry)."""
     if not LAVALINK_URI or not LAVALINK_PASSWORD:
         print("[Lavalink] Mangler URI eller PASS i miljøvariabler.")
         return False
     try:
-        # Validate existing
-        if wavelink.Pool.nodes:
+        # Drop any existing node so we always reconnect from scratch.
+        for node in list(getattr(wavelink.Pool, "nodes", {}).values()):
             try:
-                node = wavelink.Pool.get_node()
-                await node.fetch_stats()
-                return True
+                await node.disconnect()
             except Exception:
-                # Drop stale nodes
-                for node in list(getattr(wavelink.Pool, "nodes", {}).values()):
-                    try:
-                        await node.disconnect()
-                    except Exception:
-                        pass
+                pass
+
         node = _build_node()
         await wavelink.Pool.connect(client=bot, nodes=[node])
         await node.fetch_stats()
@@ -92,12 +86,14 @@ async def connect_lavalink() -> bool:
         return False
 
 
-def is_lavalink_connected() -> bool:
+async def ensure_lavalink_ready() -> bool:
     try:
-        wavelink.Pool.get_node()
+        node = wavelink.Pool.get_node()
+        await node.fetch_stats()
         return True
     except Exception:
-        return False
+        return await connect_lavalink()
+
 
 @bot.check
 async def globally_block_servers(ctx):
@@ -156,10 +152,9 @@ async def set_youtube_cache(query, yt_title, yt_url):
         await db.commit()
 
 
-# ----------------------------
 # Apple Music helper (bruker iTunes public lookup API)
 # Gjenbruker spotify_cache ved å lagre nøkkel 'apple:<id>' -> ytsearch...
-# ----------------------------
+
 async def fetch_apple_track(track_id: str, country: str) -> tuple | None:
     """Returner (title, artist) for Apple Music track id eller None hvis ikke funnet."""
     url = f"https://itunes.apple.com/lookup?id={track_id}&country={country}"
@@ -176,9 +171,8 @@ async def fetch_apple_track(track_id: str, country: str) -> tuple | None:
     except Exception as e:
         print(f"[AppleMusic] Lookup-feil: {e}")
         return None
-# ----------------------------
+
 # Guild state (multi-server support)
-# ----------------------------
 # Hver server får sin egen kø slik at flere kan spille samtidig uten å påvirke hverandre.
 music_queues = {}          # guild.id -> list[wavelink.Track]
 embed_messages = {}        # guild.id -> discord.Message (now playing)
@@ -186,8 +180,7 @@ track_start_times = {}     # guild.id -> start timestamp
 track_data = {}            # guild.id -> (track, ctx)
 update_tasks = {}          # guild.id -> asyncio.Task (progress updater)
 loop_status = {}           # (ikke i bruk, beholdt for fremtidig funksjon)
-spotify_track_cache = {}   # "spotify_track_id" -> "ytsearch:..."
-youtube_result_cache = {}  # "ytsearch:..." -> wavelink.Track (ikke i bruk direkte nå)
+pause_start_times = {}     # guild.id -> pause start timestamp
 
 
 def is_playing(vc):
@@ -195,8 +188,56 @@ def is_playing(vc):
 
 
 def get_guild_queue(guild_id: int):
-    """Returner (og opprett ved behov) kø for en guild."""
+    # Returner (og opprett ved behov) kø for en guild.
     return music_queues.setdefault(guild_id, [])
+
+
+async def _auto_delete_message(msg: discord.Message, delay: float):
+    try:
+        await asyncio.sleep(delay)
+        await msg.delete()
+    except asyncio.CancelledError:
+        pass
+    except (discord.Forbidden, discord.NotFound):
+        pass
+
+
+async def stop_and_clear(ctx, *, notify=None, disconnect=True, delete_after=15):
+    guild_id = ctx.guild.id
+    vc = ctx.voice_client
+    if vc:
+        try:
+            await vc.stop()
+        except Exception:
+            pass
+        if disconnect:
+            try:
+                await vc.disconnect()
+            except Exception:
+                pass
+
+    get_guild_queue(guild_id).clear()
+    pause_start_times.pop(guild_id, None)
+    track_start_times.pop(guild_id, None)
+    track_data.pop(guild_id, None)
+    await bot.change_presence(activity=None)
+
+    embed_msg = embed_messages.pop(guild_id, None)
+    if embed_msg:
+        try:
+            await embed_msg.delete()
+        except discord.NotFound:
+            pass
+
+    current_task = asyncio.current_task()
+    task = update_tasks.pop(guild_id, None)
+    if task and task is not current_task:
+        task.cancel()
+
+    if notify:
+        message = await ctx.send(notify)
+        if delete_after:
+            asyncio.create_task(_auto_delete_message(message, delete_after))
 
 
 class QueueView(discord.ui.View):
@@ -258,38 +299,20 @@ class SongView(discord.ui.View):
     async def pause_resume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         vc = self.ctx.voice_client
+        guild_id = self.ctx.guild.id
         if vc.paused:
             await vc.pause(False)
+            pause_start_times.pop(guild_id, None)
             await self.ctx.send("**Player resumed**", delete_after=2)
         else:
             await vc.pause(True)
+            pause_start_times[guild_id] = time.time()
             await self.ctx.send("**Player paused**", delete_after=2)
 
     @discord.ui.button(emoji='\u23F9')
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        ctx = self.ctx
-        guild_id = ctx.guild.id
-        vc = ctx.voice_client
-        if vc:
-            await vc.stop()
-            await vc.disconnect()
-
-        # Tøm kun denne guild sin kø
-        guild_queue = get_guild_queue(guild_id)
-        guild_queue.clear()
-        await bot.change_presence(activity=None)
-
-        embed_msg = embed_messages.get(guild_id)
-        if embed_msg:
-            try:
-                await embed_msg.delete()
-            except discord.NotFound:
-                pass
-            embed_messages.pop(guild_id, None)
-        if guild_id in update_tasks:
-            update_tasks[guild_id].cancel()
-            update_tasks.pop(guild_id, None)
+        await stop_and_clear(self.ctx)
 
     @discord.ui.button(emoji='\u23ED')
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -331,18 +354,17 @@ class SongView(discord.ui.View):
         await interaction.response.send_message(embed=embed, view=QueueView(self.ctx), ephemeral=True)
 
 
-
 async def show_now_playing(song, ctx):
     global embed_messages
     guild_id = ctx.guild.id
     track_start_times[guild_id] = time.time()
     track_data[guild_id] = (song, ctx)
+    pause_start_times.pop(guild_id, None)
     duration = song.length // 1000 if hasattr(song, 'length') else 0
 
     title = getattr(song, 'title', 'Ukjent sang')
     uri = getattr(song, 'uri', None)
 
-    # Thumbnail direkte her:
     try:
         thumbnail = f"https://img.youtube.com/vi/{song.identifier}/hqdefault.jpg"
     except:
@@ -413,6 +435,23 @@ async def update_progress_loop(guild_id, original_song, embed_id):
         if not vc:
             break
 
+        if getattr(vc, "paused", False):
+            start = pause_start_times.setdefault(guild_id, time.time())
+            if time.time() - start >= PAUSE_DISCONNECT_TIMEOUT:
+                if PAUSE_DISCONNECT_TIMEOUT >= 60 and PAUSE_DISCONNECT_TIMEOUT % 60 == 0:
+                    minutes = PAUSE_DISCONNECT_TIMEOUT // 60
+                    unit = "minutt" if minutes == 1 else "minutter"
+                    timeout_text = f"{minutes} {unit}"
+                else:
+                    timeout_text = f"{PAUSE_DISCONNECT_TIMEOUT} sekunder"
+                await stop_and_clear(
+                    ctx,
+                    notify=f"⏹️ Spiller stoppet etter {timeout_text} pause.",
+                )
+                break
+        else:
+            pause_start_times.pop(guild_id, None)
+
         # Bruk posisjon direkte fra spilleren, håndterer pause og alt
         elapsed = int(vc.position / 1000) if vc.position else 0
         duration = current_song.length // 1000 if hasattr(current_song, 'length') else 0
@@ -438,7 +477,6 @@ async def update_progress_loop(guild_id, original_song, embed_id):
         new_embed.add_field(name="Requested by", value=ctx.author.name, inline=True)
         new_embed.add_field(name="Songs in queue", value=f"{len(guild_queue)}", inline=True)
         new_embed.add_field(name="Progress", value=progress, inline=False)
-
         await embed_msg.edit(embed=new_embed)
 
 
@@ -446,7 +484,6 @@ async def play_next(ctx):
     vc: wavelink.Player = ctx.voice_client
     guild_id = ctx.guild.id
     guild_queue = get_guild_queue(guild_id)
-
     track_start_times.pop(guild_id, None)
     track_data.pop(guild_id, None)
 
@@ -456,27 +493,17 @@ async def play_next(ctx):
         await vc.play(next_track)
         await show_now_playing(next_track, ctx)
     else:
-        if vc:
-            await vc.disconnect()
-        await ctx.send("K\u00f8en er tom. Kobler i fra.", delete_after=3)
-        await bot.change_presence(activity=None)
+        await stop_and_clear(ctx, notify="K\u00f8en er tom. Kobler i fra.")
         try:
             await ctx.message.delete(delay=1)
         except Exception:
             pass
-        embed_msg = embed_messages.pop(guild_id, None)
-        if embed_msg:
-            try:
-                await embed_msg.delete()
-            except discord.NotFound:
-                pass
-        update_tasks.pop(guild_id, None)
 
 
 @bot.command(aliases=['PLAY', 'p', 'P'])
 async def play(ctx, *, query: str):
     # Sjekk Lavalink uten auto-retry.
-    if not is_lavalink_connected():
+    if not await ensure_lavalink_ready():
         await ctx.send(":x: Lavalink er ikke tilkoblet. Kjør !reset for å prøve å koble på nytt.", delete_after=7)
         try:
             await ctx.message.delete(delay=1)
@@ -514,21 +541,26 @@ async def play(ctx, *, query: str):
                 title, artist = meta
                 search = f"ytsearch:{title} {artist}".strip()
                 await set_spotify_cache(cache_key, search)
+            track = None
             yt_cache = await get_youtube_cache(search)
             if yt_cache:
-                tracks = await wavelink.Pool.fetch_tracks(yt_cache[1])
-                if not tracks:
-                    yt_cache = None  # force new search
+                cached_tracks = await wavelink.Pool.fetch_tracks(yt_cache[1])
+                if cached_tracks:
+                    track = cached_tracks[0]
+                else:
+                    yt_cache = None
             if not yt_cache:
-                tracks = await wavelink.Pool.fetch_tracks(search)
-                if not tracks:
-                    await ctx.send(":x: Fant ikke matchende YouTube-video.", delete_after=5)
+                fetched_tracks = await wavelink.Pool.fetch_tracks(search)
+                if not fetched_tracks:
+                    await ctx.send(":x: Fant ikke YouTube-video.", delete_after=5)
                     await ctx.message.delete(delay=1)
                     return
-                track = tracks[0]
+                track = fetched_tracks[0]
                 await set_youtube_cache(search, track.title, track.uri)
-            else:
-                track = tracks[0]
+            if track is None:
+                await ctx.send(":x: Fant ikke YouTube-video.", delete_after=5)
+                await ctx.message.delete(delay=1)
+                return
             if not is_playing(vc):
                 vc.ctx = ctx
                 await vc.play(track)
@@ -850,7 +882,6 @@ async def clearcache(ctx):
 
 @bot.command(aliases=['commands', 'cmds', 'hjelp'])
 async def info(ctx):
-    """Viser en oversikt over alle kommandoer og aliaser."""
     commands_info = [
         ("!play / !p <sang/URL>", "Spill av sang eller legg til i køen"),
         ("!queue / !q / !list / !que / !Q", "Vis musikk-køen"),
@@ -923,46 +954,13 @@ async def healthcheck(ctx):
     embed.add_field(name="🔊 Voice", value="✅ Tilkoblet" if ctx.voice_client else "⚠️ Ikke tilkoblet", inline=False)
 
     await ctx.send(embed=embed, delete_after=20)
-
     await ctx.message.delete(delay=1)
 
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def reset(ctx):
-    """Reset kun for denne serveren (tømmer dens kø og state)."""
-    guild_id = ctx.guild.id
-    vc = ctx.voice_client
-    if vc:
-        try:
-            await vc.stop()
-        except Exception:
-            pass
-        try:
-            await vc.disconnect()
-        except Exception:
-            pass
-
-    # Tøm kun denne guild sin kø og state
-    if guild_id in music_queues:
-        music_queues[guild_id].clear()
-    track_start_times.pop(guild_id, None)
-    track_data.pop(guild_id, None)
-
-    if guild_id in embed_messages:
-        try:
-            await embed_messages[guild_id].delete()
-        except Exception:
-            pass
-        embed_messages.pop(guild_id, None)
-    if guild_id in update_tasks:
-        try:
-            update_tasks[guild_id].cancel()
-        except Exception:
-            pass
-        update_tasks.pop(guild_id, None)
-
-    await bot.change_presence(activity=None)
+    await stop_and_clear(ctx)
     # Forsøk å koble Lavalink på nytt (manuell trigger)
     success = await connect_lavalink()
     status_txt = "Tilkoblet." if success else "Kunne ikke koble til Lavalink. Prøv igjen senere."
@@ -1027,9 +1025,6 @@ async def on_member_join(member):
         response = requests.get(url)
         img = Image.open(BytesIO(response.content)).convert("RGBA")
         img = img.resize((330, 330))
-    
-    img = Image.open(BytesIO(response.content)).convert("RGBA")
-    img = img.resize((330, 330))
 
     # Create a circular mask
     mask = Image.new("L", img.size, 0)
@@ -1083,7 +1078,7 @@ async def on_member_join(member):
     offset = ((background.width - bordered_image.width) // 2, (background.height - bordered_image.height) // 4)
     result = background.copy()
     result.paste(bordered_image, offset, bordered_image)
-    
+
     # Add text overlay below the circle image
     if member.discriminator == "0":
         text_overlay = f"{member.name} just joined the server"

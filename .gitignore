@@ -23,6 +23,7 @@ music_cache.db
 run.sh
 *.log
 .cache
+test.py
 
 # Byte-compiled / optimized / DLL files
 build/
