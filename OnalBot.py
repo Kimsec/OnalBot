@@ -378,7 +378,8 @@ async def show_now_playing(song, ctx):
 
     song_embed.set_author(name="Now Playing", icon_url="https://cdn3.emoji.gg/emojis/3468-skype-music.gif")
     guild_queue = get_guild_queue(ctx.guild.id)
-    song_embed.add_field(name="Requested by", value=ctx.author.name, inline=True)
+    requester = getattr(song, 'requester', ctx.author)
+    song_embed.add_field(name="Requested by", value=requester.name, inline=True)
     song_embed.add_field(name="Songs in queue", value=f"{len(guild_queue)}", inline=True)
 
     progress_bar = generate_progress_bar(0, duration)
@@ -474,7 +475,8 @@ async def update_progress_loop(guild_id, original_song, embed_id):
 
         new_embed.set_author(name="Now Playing", icon_url="https://cdn3.emoji.gg/emojis/3468-skype-music.gif")
         guild_queue = get_guild_queue(ctx.guild.id)
-        new_embed.add_field(name="Requested by", value=ctx.author.name, inline=True)
+        requester = getattr(current_song, 'requester', ctx.author)
+        new_embed.add_field(name="Requested by", value=requester.name, inline=True)
         new_embed.add_field(name="Songs in queue", value=f"{len(guild_queue)}", inline=True)
         new_embed.add_field(name="Progress", value=progress, inline=False)
         await embed_msg.edit(embed=new_embed)
@@ -563,9 +565,11 @@ async def play(ctx, *, query: str):
                 return
             if not is_playing(vc):
                 vc.ctx = ctx
+                track.requester = ctx.author
                 await vc.play(track)
                 await show_now_playing(track, ctx)
             else:
+                track.requester = ctx.author
                 guild_queue.append(track)
                 embed = discord.Embed(title=track.title, color=2303786)
                 embed.set_author(name="Added To Queue", icon_url="https://cdn3.emoji.gg/emojis/3468-skype-music.gif")
@@ -607,9 +611,11 @@ async def play(ctx, *, query: str):
                 await set_youtube_cache(search, track.title, track.uri)
             if not is_playing(vc):
                 vc.ctx = ctx
+                track.requester = ctx.author
                 await vc.play(track)
                 await show_now_playing(track, ctx)
             else:
+                track.requester = ctx.author
                 guild_queue.append(track)
                 SongEmbed = discord.Embed(title=f"{track.title}",  color=2303786)
                 SongEmbed.set_author(name="Added To Queue", icon_url="https://cdn3.emoji.gg/emojis/3468-skype-music.gif")
@@ -662,6 +668,7 @@ async def play(ctx, *, query: str):
                     track_obj = yt_results[0]
                     await set_youtube_cache(search, track_obj.title, track_obj.uri)
 
+                track_obj.requester = ctx.author
                 guild_queue.append(track_obj)
                 added += 1
 
@@ -706,6 +713,8 @@ async def play(ctx, *, query: str):
             await ctx.message.delete(delay=1)
             return
 
+        for t in tracks:
+            t.requester = ctx.author
         first_track, remaining_tracks = tracks[0], tracks[1:]
         if not is_playing(vc):
             vc.ctx = ctx
@@ -736,6 +745,7 @@ async def play(ctx, *, query: str):
         return
 
     track = tracks[0]
+    track.requester = ctx.author
     if not is_playing(vc):
         vc.ctx = ctx
         await vc.play(track)
