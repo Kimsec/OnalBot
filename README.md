@@ -1,5 +1,5 @@
 <p align="center" width="10%">
-    <img width="20%" src="logo.png"></a>
+    <img width="20%" src="logo.png" alt="OnalBot logo">
 </p>
 
 # <p align="center">OnalBot</p>
@@ -11,63 +11,79 @@
     <a href="https://github.com/Kimsec/OnalBot">
     <img src="https://img.shields.io/badge/Platform-Self%20Hosted-success" alt="Self Hosted"></a>
     <a href="https://github.com/kimsec/OnalBot/releases/latest">
-    <img src="https://img.shields.io/badge/Download-OnalBot-blue" alt="Download Badge" style="margin-right: 10px;"></a>
+    <img src="https://img.shields.io/badge/Download-OnalBot-blue" alt="Download Badge"></a>
     <a href="https://github.com/Kimsec/OnalBot/releases">
-    <img src="https://img.shields.io/github/v/release/kimsec/OnalBot" alt="Release Badge" style="margin-right: 0px;"></a>
+    <img src="https://img.shields.io/github/v/release/kimsec/OnalBot" alt="Release Badge"></a>
 </p>
 
+## What Is OnalBot?
 
+OnalBot is a self-hosted Discord music bot built with `discord.py`, `Pomice`, and `Lavalink`.
+It is designed to be simple to run, fast to use, and comfortable to control in-chat with embeds, queue tools, and player buttons.
 
-# What is OnalBot?
-
-Self-hosted Discord music bot built with discord.py + Pomice. Streams from YouTube, resolves Spotify/Apple links, caches lookups locally, and can greet newcomers with custom cards.
+Drop in a normal search, a YouTube URL, a Spotify link, or an Apple Music track link, and the bot resolves it into playable audio with local caching to keep lookups snappy.
 
 ## Highlights
 
-- Lavalink playback, queue embeds, and button controls.
-- Apple Music/Spotify support with SQLite caching.
-- Admin tools: `!reset`, cache ops, guild allow-list.
-- Optional welcome artwork with custom fonts.
+- `Pomice + Lavalink` playback with current Discord voice handling
+- Clean queue system with now-playing embeds and button controls
+- Spotify track and playlist resolving
+- Apple Music track link lookup
+- Local SQLite cache for Spotify and YouTube lookups
+- Admin utilities like `!reset`, `!healthcheck`, `!showcache`, and `!clearcache`
+- Optional welcome-card image generation for a selected server
 
-## What you need
+## Core Commands
 
-- Discord bot token with intents enabled.
-- Lavalink node you control.
-- Optional Spotify credentials for tighter matching.
-- Font file (default `arial.ttf`) for welcome cards.
+- `!play` / `!p` to play or queue music
+- `!queue`, `!remove`, `!prioritize`, `!shuffle`, `!clearqueue` to manage the queue
+- `!reset`, `!healthcheck`, `!showcache`, `!clearcache` for maintenance and status
+- Player buttons for pause/resume, skip, stop, queue view, and queue removal
 
-## Self-host in minutes
+## Quick Setup
 
-1. Clone + install:
+1. Clone the repo and install dependencies:
 
-   ```pwsh
-   git clone https://github.com/Kimsec/OnalBot.git
-   cd OnalBot
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
+```bash
+git clone https://github.com/Kimsec/OnalBot.git
+cd OnalBot
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-2. Copy `.env.example` → `.env` and set Discord token, Lavalink URI/password, allowed guild IDs, and optional Spotify keys.
+Windows PowerShell:
 
-3. Start Lavalink, then run:
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
 
-   ```pwsh
-   python OnalBot.py
-   ```
+2. Copy `.env.example` to `.env` and fill in your values:
 
-## Hosting tips
+```env
+DISCORD_TOKEN=your-bot-token
+SPOTIFY_CLIENT_ID=your-client-id
+SPOTIFY_CLIENT_SECRET=your-client-secret
+LAVALINK_URI=http://127.0.0.1:2333
+LAVALINK_PASSWORD=your-password
+ALLOWED_GUILD_IDS=214461949574905857,1064940616208883792
+FONT_PATH=./arial.ttf
+```
 
-- Use `systemd` on Linux for auto-restarts (`!reset` can hook into it).
-- Lock down Lavalink ports with firewall rules or a proxy.
-- Keep `.env` secrets private and rotate them regularly.
+3. Start your Lavalink server and make sure the URI and password match.
 
-## Commands at a glance
+4. Start the bot:
 
-- `!play` / `!p` — play a track, Apple Music link, Spotify URL, or plain search.
-- `!queue`, `!remove`, `!prioritize`, `!shuffle` — manage what’s coming up next.
-- `!clearqueue`, `!stop`, `!reset` — clean slate when you need it.
-- `!showcache`, `!clearcache`, `!healthcheck` — keep an eye on the bot’s internals.
-- `!info`, `!music` — share a command overview with your server.
+```bash
+python OnalBot.py
+```
 
-Sit back, drop a `!p miley cyrus flowers`, and let OnalBot set the vibe. 🌸
+## Notes
+
+- Leave `ALLOWED_GUILD_IDS` empty if you do not want to restrict the bot to specific servers.
+- Spotify credentials are optional unless you want Spotify URL resolving.
+- Apple Music support currently targets track links.
+- `WELCOME_GUILD_ID` is optional and only used for the welcome-card feature.
+- Cached lookups are stored in `music_cache.db`.
