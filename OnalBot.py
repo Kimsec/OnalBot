@@ -1,13 +1,13 @@
 import discord
 from discord.ext import commands
 from discord.ext.commands import CommandNotFound, CheckFailure
-import wavelink
-from wavelink import Playlist
+import pomice
 import asyncio
 import time
 import math
 import os
 from io import BytesIO
+from urllib.parse import urlparse
 from PIL import Image, ImageDraw, ImageFont
 import requests
 import aiosqlite
@@ -31,6 +31,8 @@ ALLOWED_GUILD_IDS_ENV   = os.getenv("ALLOWED_GUILD_IDS")
 APPLE_MUSIC_COUNTRY     = os.getenv("APPLE_MUSIC_COUNTRY", "NO")  # Default landkode for Apple Music lookup
 WELCOME_GUILD_ID        = int(os.getenv("WELCOME_GUILD_ID", "0"))  # Kun denne serveren får welcome-bilde (0 = deaktivert)
 PAUSE_DISCONNECT_TIMEOUT = int(os.getenv("PAUSE_DISCONNECT_TIMEOUT", "3600"))  # sekunder pauset før auto-stop
+VOICE_CONNECT_TIMEOUT    = float(os.getenv("VOICE_CONNECT_TIMEOUT", "30"))  # sekunder før voice connect timeout
+DEFAULT_VOLUME           = int(os.getenv("DEFAULT_VOLUME", "100"))  # 0-1000 (Lavalink), 100 er normalt
 ALLOWED_GUILD_IDS       = []
 if ALLOWED_GUILD_IDS_ENV:
     for part in ALLOWED_GUILD_IDS_ENV.split(','):
@@ -49,19 +51,58 @@ if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
         print(f"Spotify init error: {e}")
 DB_PATH = os.path.join(BASE_DIR, "music_cache.db")
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+LAVALINK_NODE_ID = "onalbot"
+POMICE_NO_NODES = getattr(pomice.exceptions, "NoNodesAvailable", Exception)
+POMICE_NODE_EXCEPTION = getattr(pomice.exceptions, "NodeException", Exception)
+POMICE_TRACK_LOAD_ERROR = getattr(pomice.exceptions, "TrackLoadError", Exception)
 
 
-def _build_node():
-    # Build a Node with resume settings if supported
+def _parse_lavalink_uri(uri: str) -> tuple[str, int, bool]:
+    if not uri:
+        raise ValueError("LAVALINK_URI mangler.")
+
+    parsed = urlparse(uri if "://" in uri else f"http://{uri}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("LAVALINK_URI mangler gyldig host.")
+
+    secure = parsed.scheme == "https"
+    port = parsed.port or (443 if secure else 2333)
+    return host, port, secure
+
+
+def get_lavalink_node():
+    return pomice.NodePool.get_node(identifier=LAVALINK_NODE_ID)
+
+
+def resolve_player(guild: discord.Guild | None):
+    if guild is None:
+        return None
+
+    vc = getattr(guild, "voice_client", None)
+    if isinstance(vc, pomice.Player) and not getattr(vc, "is_dead", False):
+        return vc
+
     try:
-        return wavelink.Node(
-            uri=LAVALINK_URI,
-            password=LAVALINK_PASSWORD,
-            resume_key=LAVALINK_RESUME_KEY,
-            resume_timeout=LAVALINK_RESUME_TIMEOUT,
-        )
-    except TypeError:
-        return wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
+        node = get_lavalink_node()
+    except POMICE_NO_NODES:
+        return None
+    except Exception:
+        return None
+
+    player = node.get_player(guild.id)
+    if player and not getattr(player, "is_dead", False):
+        return player
+    return None
+
+
+async def fetch_tracks(query: str, *, ctx=None):
+    node = get_lavalink_node()
+    is_url = bool(urlparse(query).scheme)
+    has_search_prefix = query.startswith(("ytsearch:", "ytmsearch:", "scsearch:", "spsearch:", "sprec:", "amsearch:"))
+    if not is_url and not has_search_prefix:
+        query = f"ytsearch:{query}"
+    return await node.get_tracks(query=query, ctx=ctx, search_type=None)
 
 
 async def connect_lavalink() -> bool:
@@ -69,16 +110,24 @@ async def connect_lavalink() -> bool:
         print("[Lavalink] Mangler URI eller PASS i miljøvariabler.")
         return False
     try:
-        # Drop any existing node so we always reconnect from scratch.
-        for node in list(getattr(wavelink.Pool, "nodes", {}).values()):
-            try:
-                await node.disconnect()
-            except Exception:
-                pass
+        try:
+            await pomice.NodePool.disconnect()
+        except Exception:
+            pass
 
-        node = _build_node()
-        await wavelink.Pool.connect(client=bot, nodes=[node])
-        await node.fetch_stats()
+        host, port, secure = _parse_lavalink_uri(LAVALINK_URI)
+        node = await pomice.NodePool.create_node(
+            bot=bot,
+            host=host,
+            port=port,
+            password=LAVALINK_PASSWORD,
+            identifier=LAVALINK_NODE_ID,
+            secure=secure,
+            resume_key=LAVALINK_RESUME_KEY,
+            resume_timeout=LAVALINK_RESUME_TIMEOUT,
+        )
+        if not node.is_connected:
+            raise RuntimeError("Node connected flag was false.")
         print("[Lavalink] Tilkoblet.")
         return True
     except Exception as e:
@@ -88,15 +137,20 @@ async def connect_lavalink() -> bool:
 
 async def ensure_lavalink_ready() -> bool:
     try:
-        node = wavelink.Pool.get_node()
-        await node.fetch_stats()
-        return True
+        node = get_lavalink_node()
+        if node and node.is_connected:
+            return True
+    except POMICE_NO_NODES:
+        pass
     except Exception:
-        return await connect_lavalink()
+        pass
+    return await connect_lavalink()
 
 
 @bot.check
 async def globally_block_servers(ctx):
+    if not ALLOWED_GUILD_IDS:
+        return True
     if ctx.guild and ctx.guild.id in ALLOWED_GUILD_IDS:
         return True
     raise commands.CheckFailure(":x: **The bot is not allowed on this server.**")
@@ -108,6 +162,32 @@ async def on_command_error(ctx, error):
 
     elif isinstance(error, CommandNotFound):
         await ctx.send(":x: Ugyldig kommando.", delete_after=8)
+
+    elif isinstance(error, commands.CommandInvokeError):
+        original = getattr(error, "original", error)
+
+        if isinstance(original, asyncio.TimeoutError):
+            await ctx.send(
+                ":x: Klarte ikke å koble til voice-kanalen (timeout). Sjekk at botten har **Connect** + **Speak** og prøv igjen.",
+                delete_after=10,
+            )
+            return
+
+        if isinstance(original, POMICE_NO_NODES):
+            await ctx.send(":x: Lavalink/Pomice-node er ikke tilgjengelig akkurat nå. Prøv !reset.", delete_after=8)
+            return
+
+        if isinstance(original, (POMICE_NODE_EXCEPTION, POMICE_TRACK_LOAD_ERROR)):
+            await ctx.send(f":x: Musikkfeil: `{original}`", delete_after=8)
+            return
+
+        if isinstance(original, discord.Forbidden):
+            await ctx.send(":x: Mangler Discord-permisjoner for denne handlingen.", delete_after=8)
+            return
+
+        print(f"CommandInvokeError i {getattr(ctx.command, 'qualified_name', 'ukjent kommando')}: {repr(original)}")
+        await ctx.send(f":x: Uventet feil i kommandoen: `{original}`", delete_after=10)
+        return
 
     else:
         print(f"Uventet feil: {error}")
@@ -174,7 +254,7 @@ async def fetch_apple_track(track_id: str, country: str) -> tuple | None:
 
 # Guild state (multi-server support)
 # Hver server får sin egen kø slik at flere kan spille samtidig uten å påvirke hverandre.
-music_queues = {}          # guild.id -> list[wavelink.Track]
+music_queues = {}          # guild.id -> list[pomice.Track]
 embed_messages = {}        # guild.id -> discord.Message (now playing)
 track_start_times = {}     # guild.id -> start timestamp
 track_data = {}            # guild.id -> (track, ctx)
@@ -184,7 +264,7 @@ pause_start_times = {}     # guild.id -> pause start timestamp
 
 
 def is_playing(vc):
-    return vc.current is not None
+    return bool(vc and getattr(vc, "is_playing", False) and getattr(vc, "current", None) is not None)
 
 
 def get_guild_queue(guild_id: int):
@@ -204,7 +284,7 @@ async def _auto_delete_message(msg: discord.Message, delay: float):
 
 async def stop_and_clear(ctx, *, notify=None, disconnect=True, delete_after=15):
     guild_id = ctx.guild.id
-    vc = ctx.voice_client
+    vc = resolve_player(ctx.guild)
     if vc:
         try:
             await vc.stop()
@@ -212,9 +292,15 @@ async def stop_and_clear(ctx, *, notify=None, disconnect=True, delete_after=15):
             pass
         if disconnect:
             try:
-                await vc.disconnect()
+                await vc.destroy()
             except Exception:
                 pass
+
+    if disconnect and ctx.guild.voice_client:
+        try:
+            await ctx.guild.voice_client.disconnect()
+        except Exception:
+            pass
 
     get_guild_queue(guild_id).clear()
     pause_start_times.pop(guild_id, None)
@@ -298,14 +384,18 @@ class SongView(discord.ui.View):
     @discord.ui.button(emoji='\u23EF')
     async def pause_resume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        vc = self.ctx.voice_client
-        guild_id = self.ctx.guild.id
-        if vc.paused:
-            await vc.pause(False)
+        vc = resolve_player(interaction.guild)
+        guild_id = interaction.guild.id
+        if not vc:
+            await self.ctx.send(":x: Ingen aktiv spiller funnet.", delete_after=4)
+            return
+        vc.ctx = self.ctx
+        if getattr(vc, "is_paused", False):
+            await vc.set_pause(False)
             pause_start_times.pop(guild_id, None)
             await self.ctx.send("**Player resumed**", delete_after=2)
         else:
-            await vc.pause(True)
+            await vc.set_pause(True)
             pause_start_times[guild_id] = time.time()
             await self.ctx.send("**Player paused**", delete_after=2)
 
@@ -317,7 +407,7 @@ class SongView(discord.ui.View):
     @discord.ui.button(emoji='\u23ED')
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        vc = self.ctx.voice_client
+        vc = resolve_player(interaction.guild)
         if not vc or not is_playing(vc):
             return await self.ctx.send(":x: **No music is playing at the moment.**", delete_after=5)
         vc.ctx = self.ctx
@@ -432,11 +522,11 @@ async def update_progress_loop(guild_id, original_song, embed_id):
         if not embed_msg or embed_msg.id != embed_id:
             break
 
-        vc = ctx.voice_client
+        vc = resolve_player(ctx.guild)
         if not vc:
             break
 
-        if getattr(vc, "paused", False):
+        if getattr(vc, "is_paused", False):
             start = pause_start_times.setdefault(guild_id, time.time())
             if time.time() - start >= PAUSE_DISCONNECT_TIMEOUT:
                 if PAUSE_DISCONNECT_TIMEOUT >= 60 and PAUSE_DISCONNECT_TIMEOUT % 60 == 0:
@@ -483,16 +573,24 @@ async def update_progress_loop(guild_id, original_song, embed_id):
 
 
 async def play_next(ctx):
-    vc: wavelink.Player = ctx.voice_client
+    vc: pomice.Player | None = resolve_player(ctx.guild)
     guild_id = ctx.guild.id
     guild_queue = get_guild_queue(guild_id)
     track_start_times.pop(guild_id, None)
     track_data.pop(guild_id, None)
 
+    if not vc:
+        await stop_and_clear(ctx, notify=":x: Fant ikke aktiv spiller. Kobler i fra.")
+        return
+
     if guild_queue:
         next_track = guild_queue.pop(0)
         vc.ctx = ctx
         await vc.play(next_track)
+        try:
+            await vc.set_volume(DEFAULT_VOLUME)
+        except Exception:
+            pass
         await show_now_playing(next_track, ctx)
     else:
         await stop_and_clear(ctx, notify="K\u00f8en er tom. Kobler i fra.")
@@ -514,7 +612,14 @@ async def play(ctx, *, query: str):
         return
     if not await ensure_voice(ctx):
         return
-    vc: wavelink.Player = ctx.voice_client
+    vc: pomice.Player | None = resolve_player(ctx.guild)
+    if not vc:
+        await ctx.send(":x: Klarte ikke å opprette Pomice-player for voice-kanalen.", delete_after=6)
+        try:
+            await ctx.message.delete(delay=1)
+        except Exception:
+            pass
+        return
     guild_queue = get_guild_queue(ctx.guild.id)
     if any(domain in query for domain in ("music.youtube.com/watch", "m.youtube.com/watch")):
         if "v=" in query:
@@ -546,13 +651,13 @@ async def play(ctx, *, query: str):
             track = None
             yt_cache = await get_youtube_cache(search)
             if yt_cache:
-                cached_tracks = await wavelink.Pool.fetch_tracks(yt_cache[1])
+                cached_tracks = await fetch_tracks(yt_cache[1], ctx=ctx)
                 if cached_tracks:
                     track = cached_tracks[0]
                 else:
                     yt_cache = None
             if not yt_cache:
-                fetched_tracks = await wavelink.Pool.fetch_tracks(search)
+                fetched_tracks = await fetch_tracks(search, ctx=ctx)
                 if not fetched_tracks:
                     await ctx.send(":x: Fant ikke YouTube-video.", delete_after=5)
                     await ctx.message.delete(delay=1)
@@ -567,6 +672,10 @@ async def play(ctx, *, query: str):
                 vc.ctx = ctx
                 track.requester = ctx.author
                 await vc.play(track)
+                try:
+                    await vc.set_volume(DEFAULT_VOLUME)
+                except Exception:
+                    pass
                 await show_now_playing(track, ctx)
             else:
                 track.requester = ctx.author
@@ -596,13 +705,13 @@ async def play(ctx, *, query: str):
                 await set_spotify_cache(track_id, search)
             yt_cache = await get_youtube_cache(search)
             if yt_cache:
-                track = await wavelink.Pool.fetch_tracks(yt_cache[1])
+                track = await fetch_tracks(yt_cache[1], ctx=ctx)
                 if not track:
                     raise Exception("YouTube-cache tom.")
                     await ctx.message.delete(delay=1)
                 track = track[0]
             else:
-                results = await wavelink.Pool.fetch_tracks(search)
+                results = await fetch_tracks(search, ctx=ctx)
                 if not results:
                     await ctx.send("Fant ikke sang på YouTube.", delete_after=5)
                     await ctx.message.delete(delay=1)
@@ -613,6 +722,10 @@ async def play(ctx, *, query: str):
                 vc.ctx = ctx
                 track.requester = ctx.author
                 await vc.play(track)
+                try:
+                    await vc.set_volume(DEFAULT_VOLUME)
+                except Exception:
+                    pass
                 await show_now_playing(track, ctx)
             else:
                 track.requester = ctx.author
@@ -657,12 +770,12 @@ async def play(ctx, *, query: str):
 
                 yt_cache = await get_youtube_cache(search)
                 if yt_cache:
-                    track_obj = await wavelink.Pool.fetch_tracks(yt_cache[1])
+                    track_obj = await fetch_tracks(yt_cache[1], ctx=ctx)
                     if not track_obj:
                         continue
                     track_obj = track_obj[0]
                 else:
-                    yt_results = await wavelink.Pool.fetch_tracks(search)
+                    yt_results = await fetch_tracks(search, ctx=ctx)
                     if not yt_results:
                         continue
                     track_obj = yt_results[0]
@@ -695,15 +808,15 @@ async def play(ctx, *, query: str):
                 playlist_url = f"https://www.youtube.com/watch?v={video_id}"
 
         try:
-            fetched = await wavelink.Pool.fetch_tracks(playlist_url)
+            fetched = await fetch_tracks(playlist_url, ctx=ctx)
         except Exception as e:
             await ctx.send(f":x: Klarte ikke hente YouTube-spilleliste: {e}", delete_after=6)
             await ctx.message.delete(delay=1)
             return
 
-        if isinstance(fetched, Playlist):
+        if hasattr(fetched, "tracks"):
             tracks = list(fetched.tracks)
-            playlist_name = fetched.name
+            playlist_name = getattr(fetched, "name", None)
         else:
             tracks = list(fetched) if isinstance(fetched, list) else []
             playlist_name = None
@@ -719,6 +832,10 @@ async def play(ctx, *, query: str):
         if not is_playing(vc):
             vc.ctx = ctx
             await vc.play(first_track)
+            try:
+                await vc.set_volume(DEFAULT_VOLUME)
+            except Exception:
+                pass
             await show_now_playing(first_track, ctx)
             guild_queue.extend(remaining_tracks)
         else:
@@ -733,7 +850,7 @@ async def play(ctx, *, query: str):
     if (query.startswith("https://www.youtube.com/watch") or query.startswith("https://youtu.be/")) and "list=" not in query:
         query = query.split("&")[0]
     try:
-        tracks = await wavelink.Pool.fetch_tracks(f"ytsearch:{query}")
+        tracks = await fetch_tracks(f"ytsearch:{query}", ctx=ctx)
     except Exception as e:
         await ctx.send(f"Feil ved henting av sang: {e}", delete_after=5)
         await ctx.message.delete(delay=1)
@@ -749,6 +866,10 @@ async def play(ctx, *, query: str):
     if not is_playing(vc):
         vc.ctx = ctx
         await vc.play(track)
+        try:
+            await vc.set_volume(DEFAULT_VOLUME)
+        except Exception:
+            pass
         await show_now_playing(track, ctx)
     else:
         guild_queue.append(track)
@@ -768,14 +889,61 @@ async def ensure_voice(ctx):
         await ctx.message.delete(delay=1)
         return False
 
-    vc = ctx.voice_client
+    # Permission checks (Connect + Speak). Manglende Speak gir ofte "alt virker men ingen lyd".
+    try:
+        me = ctx.guild.me or ctx.guild.get_member(bot.user.id)
+        if me:
+            perms = voice_channel.permissions_for(me)
+            if not perms.connect:
+                await ctx.send(":x: Botten mangler **Connect** i denne voice-kanalen.", delete_after=6)
+                await ctx.message.delete(delay=1)
+                return False
+            if not perms.speak:
+                await ctx.send(":x: Botten mangler **Speak** i denne voice-kanalen (da får du ingen lyd).", delete_after=8)
+                await ctx.message.delete(delay=1)
+                return False
+    except Exception:
+        pass
+
+    vc = resolve_player(ctx.guild)
     if not vc or not getattr(vc, "channel", None):
-        await voice_channel.connect(cls=wavelink.Player, self_deaf=True)
+        vc = await voice_channel.connect(
+            cls=pomice.Player,
+            self_deaf=True,
+            reconnect=True,
+            timeout=VOICE_CONNECT_TIMEOUT,
+        )
+        vc.ctx = ctx
+
+        # Stage-kanaler: bot kan være "suppressed" og da kommer det ingen lyd.
+        try:
+            if isinstance(voice_channel, discord.StageChannel):
+                try:
+                    await voice_channel.request_to_speak()
+                except Exception:
+                    # Fallback: prøv å unsuppresse
+                    if ctx.guild.me:
+                        await ctx.guild.me.edit(suppress=False)
+        except Exception:
+            pass
+
         await ctx.send(f":thumbsup: **Koblet til** `{voice_channel}` og laster sang...", delete_after=3)
         await ctx.message.delete(delay=1)
         return True
     elif vc.channel != voice_channel:
         await vc.move_to(voice_channel)
+
+        # Stage-kanaler: samme håndtering etter flytt
+        try:
+            if isinstance(voice_channel, discord.StageChannel):
+                try:
+                    await voice_channel.request_to_speak()
+                except Exception:
+                    if ctx.guild.me:
+                        await ctx.guild.me.edit(suppress=False)
+        except Exception:
+            pass
+
         await ctx.send(f"Flyttet til `{voice_channel}`", delete_after=3)
         await ctx.message.delete(delay=1)
         return True
@@ -786,15 +954,49 @@ async def ensure_voice(ctx):
 async def on_ready():
     print(f"Logget inn som {bot.user.name}")
     await init_cache_db()
-    await connect_lavalink()
+    await ensure_lavalink_ready()
 
 @bot.event
-async def on_wavelink_track_end(payload):
-    player = payload.player
-    reason = str(payload.reason).lower()
+async def on_pomice_track_end(player, track, reason):
+    reason = str(reason).lower()
     ctx = getattr(player, "ctx", None)
     if ctx and reason == "finished":
         await play_next(ctx)
+
+
+@bot.event
+async def on_pomice_track_exception(player, track, exception):
+    ctx = getattr(player, "ctx", None)
+    print(f"[Pomice] Track exception: {exception}")
+    if ctx:
+        await play_next(ctx)
+
+
+@bot.event
+async def on_pomice_track_stuck(player, track, threshold):
+    ctx = getattr(player, "ctx", None)
+    print(f"[Pomice] Track stuck: {threshold}")
+    if ctx:
+        await play_next(ctx)
+
+
+def _stat_value(obj, *path):
+    current = obj
+    for key in path:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return current
+
+
+def _format_uptime_ms(uptime_ms):
+    uptime_ms = int(uptime_ms or 0)
+    hours, rem = divmod(uptime_ms // 1000, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
 @bot.command(aliases=['q', 'list', 'que', 'Q'])
@@ -917,26 +1119,28 @@ async def info(ctx):
 @bot.command(aliases=["ping", "status", "health"])
 async def healthcheck(ctx):
     try:
-        node = wavelink.Pool.get_node()
-        stats = await node.fetch_stats()
+        node = get_lavalink_node()
+        stats = getattr(node, "stats", None)
 
-        # RAM (bruk objekt-attributter, ikke dict)
-        used = stats.memory.used // 1024**2
-        allocated = stats.memory.allocated // 1024**2
+        players = _stat_value(stats, "players")
+        if players is None:
+            players = getattr(node, "player_count", None)
 
-        # Uptime
-        uptime_ms = stats.uptime
-        hours, rem = divmod(uptime_ms // 1000, 3600)
-        minutes, seconds = divmod(rem, 60)
-        uptime = f"{hours:02}:{minutes:02}:{seconds:02}"
+        used = _stat_value(stats, "memory", "used")
+        allocated = _stat_value(stats, "memory", "allocated")
+        uptime_ms = _stat_value(stats, "uptime")
+        ping = getattr(node, "ping", None)
 
-        lavalink_info = (
-            f"🟢 Tilkoblet\n"
-            f"• Spillere: {stats.players}\n"
-            f"• RAM: {used}MB / {allocated}MB\n"
-            f"• Uptime: {uptime}"
-        )
-
+        lines = ["🟢 Tilkoblet" if getattr(node, "is_connected", False) else "⚠️ Ikke tilkoblet"]
+        if players is not None:
+            lines.append(f"• Spillere: {players}")
+        if used is not None and allocated is not None:
+            lines.append(f"• RAM: {used // 1024**2}MB / {allocated // 1024**2}MB")
+        if uptime_ms is not None:
+            lines.append(f"• Uptime: {_format_uptime_ms(uptime_ms)}")
+        if ping is not None:
+            lines.append(f"• Ping: {ping}ms")
+        lavalink_info = "\n".join(lines)
     except Exception as e:
         lavalink_info = f"🔴 Lavalink-feil: `{e}`"
 
@@ -961,7 +1165,7 @@ async def healthcheck(ctx):
     embed.add_field(name="🎧 Lavalink", value=lavalink_info, inline=False)
     embed.add_field(name="🎶 Spotify", value=spotify_status, inline=False)
     embed.add_field(name="💽 Cache", value=f"Spotify: {spotify_count}\nYouTube: {youtube_count}", inline=False)
-    embed.add_field(name="🔊 Voice", value="✅ Tilkoblet" if ctx.voice_client else "⚠️ Ikke tilkoblet", inline=False)
+    embed.add_field(name="🔊 Voice", value="✅ Tilkoblet" if resolve_player(ctx.guild) else "⚠️ Ikke tilkoblet", inline=False)
 
     await ctx.send(embed=embed, delete_after=20)
     await ctx.message.delete(delay=1)
@@ -986,19 +1190,19 @@ async def music(ctx):
     await ctx.message.delete(delay=1)
     embed_gather = discord.Embed(color=discord.Color.purple())
     embed_gather.set_author(name="Commands to play music:", icon_url="https://cdn3.emoji.gg/emojis/4579-pepediscodj.gif")
-    embed_gather.add_field( 
-        name="Command:", 
-        value="```yaml\n!play | !p\n      | ⏯️\n      | ⏯️\n!skip | ⏭️\n!stop | ⏹️\n!q    | 📜\n!rm   | ❌\n!shuffle\n!Prio <nr>\n!clearq\n!reset```", 
+    embed_gather.add_field(
+        name="Command:",
+        value="```yaml\n!play | !p\n      | ⏯️\n      | ⏯️\n!skip | ⏭️\n!stop | ⏹️\n!q    | 📜\n!rm   | ❌\n!shuffle\n!Prio <nr>\n!clearq\n!reset```",
         inline=True
     )
     embed_gather.add_field(
-        name="Functionality:", 
-        value="```yaml\nPlay <song> or queue more songs\nPause song\nResume playing song\nSkip to next song in the queue\nStop playing, leave, & clear the queue\nSee the queue\nRemove song from Queue.\nMix/Shuffle the queue\nMove song to front queue\nClear the queue\nReset the bot```", 
+        name="Functionality:",
+        value="```yaml\nPlay <song> or queue more songs\nPause song\nResume playing song\nSkip to next song in the queue\nStop playing, leave, & clear the queue\nSee the queue\nRemove song from Queue.\nMix/Shuffle the queue\nMove song to front queue\nClear the queue\nReset the bot```",
         inline=True
     )
     embed_gather.add_field(
-        name="Usage", 
-        value="```yaml\n!p <URL> or <artist - song name>\n\nExample: !p https://youtu.be/dQw4w9WgXcQ\nExample: !p miley cyrus flowers```", 
+        name="Usage",
+        value="```yaml\n!p <URL> or <artist - song name>\n\nExample: !p https://youtu.be/dQw4w9WgXcQ\nExample: !p miley cyrus flowers```",
         inline=False
     )
     embed_gather.set_footer(text="Music bot by Mus❤️ Enjoy.")
@@ -1093,7 +1297,7 @@ async def on_member_join(member):
     if member.discriminator == "0":
         text_overlay = f"{member.name} just joined the server"
     else:
-        text_overlay = f"{member} just joined the server" 
+        text_overlay = f"{member} just joined the server"
     font_size = 50
     font_color = (255, 255, 255)
     font = ImageFont.truetype(FONT_PATH, font_size)
