@@ -256,10 +256,8 @@ async def fetch_apple_track(track_id: str, country: str) -> tuple | None:
 # Hver server får sin egen kø slik at flere kan spille samtidig uten å påvirke hverandre.
 music_queues = {}          # guild.id -> list[pomice.Track]
 embed_messages = {}        # guild.id -> discord.Message (now playing)
-track_start_times = {}     # guild.id -> start timestamp
 track_data = {}            # guild.id -> (track, ctx)
 update_tasks = {}          # guild.id -> asyncio.Task (progress updater)
-loop_status = {}           # (ikke i bruk, beholdt for fremtidig funksjon)
 pause_start_times = {}     # guild.id -> pause start timestamp
 
 
@@ -304,7 +302,6 @@ async def stop_and_clear(ctx, *, notify=None, disconnect=True, delete_after=15):
 
     get_guild_queue(guild_id).clear()
     pause_start_times.pop(guild_id, None)
-    track_start_times.pop(guild_id, None)
     track_data.pop(guild_id, None)
     await bot.change_presence(activity=None)
 
@@ -326,20 +323,88 @@ async def stop_and_clear(ctx, *, notify=None, disconnect=True, delete_after=15):
             asyncio.create_task(_auto_delete_message(message, delete_after))
 
 
+def _queue_page_count(total_items: int, page_size: int) -> int:
+    return max(1, math.ceil(total_items / page_size))
+
+
+def _queue_remove_embed(page: int, total_pages: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="Klikk for å fjerne en sang fra køen",
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text=f"Side {page}/{total_pages}")
+    return embed
+
+
+def _queue_button_label(position: int, title: str, *, max_length: int = 80) -> str:
+    prefix = f"{position}. "
+    available = max_length - len(prefix)
+    if available <= 0:
+        return prefix[:max_length]
+    if len(title) <= available:
+        return f"{prefix}{title}"
+    if available <= 3:
+        return f"{prefix}{title[:available]}"
+    return f"{prefix}{title[:available - 3]}..."
+
+
 class QueueView(discord.ui.View):
-    def __init__(self, ctx):
+    def __init__(self, ctx, *, page: int = 0, page_size: int = 20):
         super().__init__(timeout=None)
         self.ctx = ctx
+        self.page_size = page_size
         guild_queue = get_guild_queue(ctx.guild.id)
-        for idx, track in enumerate(guild_queue):
-            self.add_item(RemoveButton(label=f"{idx + 1}. {track.title}", index=idx, ctx=ctx))
+        total_items = len(guild_queue)
+        total_pages = _queue_page_count(total_items, page_size)
+        self.page = min(max(page, 0), total_pages - 1)
+
+        start = self.page * page_size
+        page_tracks = guild_queue[start:start + page_size]
+
+        for local_index, track in enumerate(page_tracks):
+            global_index = start + local_index
+            self.add_item(
+                RemoveButton(
+                    label=_queue_button_label(global_index + 1, track.title),
+                    index=global_index,
+                    track=track,
+                    ctx=ctx,
+                    page=self.page,
+                    page_size=page_size,
+                    row=local_index // 5,
+                )
+            )
+
+        self.add_item(
+            QueuePageButton(
+                label="⬅️ Forrige",
+                ctx=ctx,
+                target_page=self.page - 1,
+                page_size=page_size,
+                disabled=self.page == 0,
+            )
+        )
+        self.add_item(QueuePageIndicator(page=self.page + 1, total_pages=total_pages))
+        self.add_item(
+            QueuePageButton(
+                label="Neste ➡️",
+                ctx=ctx,
+                target_page=self.page + 1,
+                page_size=page_size,
+                disabled=self.page >= total_pages - 1,
+            )
+        )
+        self.add_item(QueueCloseButton(ctx=ctx))
 
 
 class RemoveButton(discord.ui.Button):
-    def __init__(self, label, index, ctx):
-        super().__init__(label=label, style=discord.ButtonStyle.red, row=index % 5)
+    def __init__(self, label, index, track, ctx, page, page_size, row):
+        super().__init__(label=label, style=discord.ButtonStyle.red, row=row)
         self.index = index
+        self.track = track
         self.ctx = ctx
+        self.page = page
+        self.page_size = page_size
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user != self.ctx.author:
@@ -348,18 +413,19 @@ class RemoveButton(discord.ui.Button):
 
         try:
             guild_queue = get_guild_queue(self.ctx.guild.id)
-            removed = guild_queue.pop(self.index)
+            if 0 <= self.index < len(guild_queue) and guild_queue[self.index] is self.track:
+                removed = guild_queue.pop(self.index)
+            else:
+                current_index = guild_queue.index(self.track)
+                removed = guild_queue.pop(current_index)
 
-            # Lag ny embed og view basert på oppdatert kø
             if guild_queue:
-                embed = discord.Embed(
-                    title="Klikk for å fjerne en sang fra køen",
-                    color=discord.Color.orange()
-                )
+                total_pages = _queue_page_count(len(guild_queue), self.page_size)
+                next_page = min(self.page, total_pages - 1)
                 await interaction.response.edit_message(
                     content=f"✅ Fjernet: **{removed.title}**",
-                    embed=embed,
-                    view=QueueView(self.ctx)
+                    embed=_queue_remove_embed(next_page + 1, total_pages),
+                    view=QueueView(self.ctx, page=next_page, page_size=self.page_size)
                 )
             else:
                 await interaction.response.edit_message(
@@ -368,11 +434,60 @@ class RemoveButton(discord.ui.Button):
                     view=None
                 )
 
-            # Offentlig logg
-            await interaction.channel.send(f"❌ {interaction.user.mention} fjernet: **{removed.title}**", delete_after=5)
+            if interaction.channel:
+                await interaction.channel.send(f"❌ {interaction.user.mention} fjernet: **{removed.title}**", delete_after=5)
 
-        except IndexError:
+        except (IndexError, ValueError):
             await interaction.response.send_message(":x: Listen kan ha blitt endret. Prøv på nytt.", ephemeral=True)
+
+
+class QueuePageButton(discord.ui.Button):
+    def __init__(self, label, ctx, target_page, page_size, disabled):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=4, disabled=disabled)
+        self.ctx = ctx
+        self.target_page = target_page
+        self.page_size = page_size
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message(":x: Bare personen som ba om listen kan endre den.", ephemeral=True)
+            return
+
+        guild_queue = get_guild_queue(self.ctx.guild.id)
+        if not guild_queue:
+            await interaction.response.edit_message(content="🎵 Køen er tom.", embed=None, view=None)
+            return
+
+        total_pages = _queue_page_count(len(guild_queue), self.page_size)
+        target_page = min(max(self.target_page, 0), total_pages - 1)
+        await interaction.response.edit_message(
+            content=None,
+            embed=_queue_remove_embed(target_page + 1, total_pages),
+            view=QueueView(self.ctx, page=target_page, page_size=self.page_size)
+        )
+
+
+class QueuePageIndicator(discord.ui.Button):
+    def __init__(self, page, total_pages):
+        super().__init__(
+            label=f"Side {page}/{total_pages}",
+            style=discord.ButtonStyle.secondary,
+            row=4,
+            disabled=True,
+        )
+
+
+class QueueCloseButton(discord.ui.Button):
+    def __init__(self, ctx):
+        super().__init__(label="Lukk", style=discord.ButtonStyle.secondary, row=4)
+        self.ctx = ctx
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message(":x: Bare personen som ba om listen kan endre den.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(content="Fjerningslisten ble lukket.", embed=None, view=None)
 
 
 class SongView(discord.ui.View):
@@ -437,17 +552,16 @@ class SongView(discord.ui.View):
             await self.ctx.send("🎵 Køen er tom.", delete_after=3)
             return
 
-        embed = discord.Embed(
-            title="Klikk for å fjerne en sang fra køen",
-            color=discord.Color.orange()
+        total_pages = _queue_page_count(len(guild_queue), 20)
+        await interaction.response.send_message(
+            embed=_queue_remove_embed(1, total_pages),
+            view=QueueView(self.ctx, page=0, page_size=20),
+            ephemeral=True,
         )
-        await interaction.response.send_message(embed=embed, view=QueueView(self.ctx), ephemeral=True)
 
 
 async def show_now_playing(song, ctx):
-    global embed_messages
     guild_id = ctx.guild.id
-    track_start_times[guild_id] = time.time()
     track_data[guild_id] = (song, ctx)
     pause_start_times.pop(guild_id, None)
     duration = song.length // 1000 if hasattr(song, 'length') else 0
@@ -576,7 +690,6 @@ async def play_next(ctx):
     vc: pomice.Player | None = resolve_player(ctx.guild)
     guild_id = ctx.guild.id
     guild_queue = get_guild_queue(guild_id)
-    track_start_times.pop(guild_id, None)
     track_data.pop(guild_id, None)
 
     if not vc:
@@ -708,7 +821,6 @@ async def play(ctx, *, query: str):
                 track = await fetch_tracks(yt_cache[1], ctx=ctx)
                 if not track:
                     raise Exception("YouTube-cache tom.")
-                    await ctx.message.delete(delay=1)
                 track = track[0]
             else:
                 results = await fetch_tracks(search, ctx=ctx)
@@ -850,7 +962,7 @@ async def play(ctx, *, query: str):
     if (query.startswith("https://www.youtube.com/watch") or query.startswith("https://youtu.be/")) and "list=" not in query:
         query = query.split("&")[0]
     try:
-        tracks = await fetch_tracks(f"ytsearch:{query}", ctx=ctx)
+        tracks = await fetch_tracks(query, ctx=ctx)
     except Exception as e:
         await ctx.send(f"Feil ved henting av sang: {e}", delete_after=5)
         await ctx.message.delete(delay=1)
@@ -888,8 +1000,6 @@ async def ensure_voice(ctx):
         await ctx.send(":x: Du m\u00e5 v\u00e6re i en voice-kanal.", delete_after=3)
         await ctx.message.delete(delay=1)
         return False
-
-    # Permission checks (Connect + Speak). Manglende Speak gir ofte "alt virker men ingen lyd".
     try:
         me = ctx.guild.me or ctx.guild.get_member(bot.user.id)
         if me:
@@ -914,14 +1024,11 @@ async def ensure_voice(ctx):
             timeout=VOICE_CONNECT_TIMEOUT,
         )
         vc.ctx = ctx
-
-        # Stage-kanaler: bot kan være "suppressed" og da kommer det ingen lyd.
         try:
             if isinstance(voice_channel, discord.StageChannel):
                 try:
                     await voice_channel.request_to_speak()
                 except Exception:
-                    # Fallback: prøv å unsuppresse
                     if ctx.guild.me:
                         await ctx.guild.me.edit(suppress=False)
         except Exception:
@@ -932,8 +1039,6 @@ async def ensure_voice(ctx):
         return True
     elif vc.channel != voice_channel:
         await vc.move_to(voice_channel)
-
-        # Stage-kanaler: samme håndtering etter flytt
         try:
             if isinstance(voice_channel, discord.StageChannel):
                 try:
@@ -1082,7 +1187,7 @@ async def showcache(ctx):
 
 
 @bot.command()
-@commands.has_permissions(administrator=True)  # Sikrer at bare du kan kjøre den
+@commands.has_permissions(administrator=True)
 async def clearcache(ctx):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM spotify_cache")
@@ -1192,7 +1297,7 @@ async def music(ctx):
     embed_gather.set_author(name="Commands to play music:", icon_url="https://cdn3.emoji.gg/emojis/4579-pepediscodj.gif")
     embed_gather.add_field(
         name="Command:",
-        value="```yaml\n!play | !p\n      | ⏯️\n      | ⏯️\n!skip | ⏭️\n!stop | ⏹️\n!q    | 📜\n!rm   | ❌\n!shuffle\n!Prio <nr>\n!clearq\n!reset```",
+        value="```yaml\n!play | !p\n      | ⏯️\n      | ⏯️\n      | ⏭️\n      | ⏹️\n!q    | 📜\n!rm   | ❌\n!shuffle\n!Prio <nr>\n!clearq\n!reset```",
         inline=True
     )
     embed_gather.add_field(
@@ -1224,8 +1329,13 @@ async def on_member_join(member):
     # Kjør kun på spesifikk server hvis WELCOME_GUILD_ID er satt
     if WELCOME_GUILD_ID and member.guild.id != WELCOME_GUILD_ID:
         return
+
+    system_channel = member.guild.system_channel
+    if not system_channel:
+        return
+
     # Create welcome message
-    welcome_message = f"Hey {member.mention}, Welcome to **Onal** 🍑! "
+    welcome_message = f"Hey {member.mention}, Welcome to **{member.guild.name}** !"
 
     # Load the profile picture
     if member.avatar:
@@ -1313,7 +1423,7 @@ async def on_member_join(member):
     img_byte_arr.seek(0)
 
     # Upload the image to Discord
-    await member.guild.system_channel.send(f"{welcome_message}", file=discord.File(fp=img_byte_arr, filename="welcome_card.png"))
+    await system_channel.send(f"{welcome_message}", file=discord.File(fp=img_byte_arr, filename="welcome_card.png"))
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable. Set it in a .env file or environment before running.")
