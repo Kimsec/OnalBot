@@ -10,7 +10,7 @@
 <p align="center">
     <a href="https://github.com/Kimsec/OnalBot">
     <img src="https://img.shields.io/badge/Platform-Self%20Hosted-success" alt="Self Hosted"></a>
-    <a href="[https://github.com/kimsec/OnalBot/releases/latest](https://github.com/Kimsec/OnalBot?tab=readme-ov-file#quick-setup)">
+    <a href="https://github.com/Kimsec/OnalBot?tab=readme-ov-file#quick-setup">
     <img src="https://img.shields.io/badge/Download-OnalBot-blue" alt="Download Badge"></a>
 </p>
 
