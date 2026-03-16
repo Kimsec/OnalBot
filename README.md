@@ -12,8 +12,6 @@
     <img src="https://img.shields.io/badge/Platform-Self%20Hosted-success" alt="Self Hosted"></a>
     <a href="https://github.com/kimsec/OnalBot/releases/latest">
     <img src="https://img.shields.io/badge/Download-OnalBot-blue" alt="Download Badge"></a>
-    <a href="https://github.com/Kimsec/OnalBot/releases">
-    <img src="https://img.shields.io/github/v/release/kimsec/OnalBot" alt="Release Badge"></a>
 </p>
 
 ## What Is OnalBot?
