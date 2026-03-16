@@ -20,7 +20,7 @@
 
 # What is OnalBot?
 
-Self-hosted Discord music bot built with discord.py + Wavelink. Streams from YouTube, resolves Spotify/Apple links, caches lookups locally, and can greet newcomers with custom cards.
+Self-hosted Discord music bot built with discord.py + Pomice. Streams from YouTube, resolves Spotify/Apple links, caches lookups locally, and can greet newcomers with custom cards.
 
 ## Highlights
 
