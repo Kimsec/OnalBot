@@ -3,6 +3,6 @@ pillow
 requests
 spotipy
 PyNaCl
-wavelink
+pomice
 aiosqlite
 python-dotenv
