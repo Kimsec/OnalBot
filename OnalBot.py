@@ -442,11 +442,13 @@ class RemoveButton(discord.ui.Button):
 
 
 class QueuePageButton(discord.ui.Button):
-    def __init__(self, label, ctx, target_page, page_size, disabled):
-        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=4, disabled=disabled)
+    def __init__(self, label, ctx, target_page, page_size, disabled, *, row=4, embed_fn=None, view_fn=None):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=row, disabled=disabled)
         self.ctx = ctx
         self.target_page = target_page
         self.page_size = page_size
+        self._embed_fn = embed_fn or (lambda q, p, ps, tp: _queue_remove_embed(p + 1, tp))
+        self._view_fn  = view_fn  or (lambda ctx, p, ps: QueueView(ctx, page=p, page_size=ps))
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user != self.ctx.author:
@@ -460,10 +462,13 @@ class QueuePageButton(discord.ui.Button):
 
         total_pages = _queue_page_count(len(guild_queue), self.page_size)
         target_page = min(max(self.target_page, 0), total_pages - 1)
+        self.view.stop()
+        new_view = self._view_fn(self.ctx, target_page, self.page_size)
+        new_view.message = interaction.message
         await interaction.response.edit_message(
             content=None,
-            embed=_queue_remove_embed(target_page + 1, total_pages),
-            view=QueueView(self.ctx, page=target_page, page_size=self.page_size)
+            embed=self._embed_fn(guild_queue, target_page, self.page_size, total_pages),
+            view=new_view
         )
 
 
@@ -488,6 +493,42 @@ class QueueCloseButton(discord.ui.Button):
             return
 
         await interaction.response.edit_message(content="Fjerningslisten ble lukket.", embed=None, view=None)
+
+
+def _queue_display_embed(guild_queue: list, page: int, page_size: int, total_pages: int) -> discord.Embed:
+    start = page * page_size
+    lines = [f"{start + i + 1}. {track.title}" for i, track in enumerate(guild_queue[start:start + page_size])]
+    description = "\n".join(lines)[:4096]
+    embed = discord.Embed(title="🎶 Musikk-kø", description=description, color=discord.Color.blue())
+    embed.set_footer(text=f"Side {page + 1}/{total_pages} · {len(guild_queue)} sanger totalt")
+    return embed
+
+
+class QueueDisplayView(discord.ui.View):
+    def __init__(self, ctx, *, page: int = 0, page_size: int = 20):
+        super().__init__(timeout=20)
+        self.ctx = ctx
+        self.message = None
+        guild_queue = get_guild_queue(ctx.guild.id)
+        total_pages = _queue_page_count(len(guild_queue), page_size)
+        nav = lambda ctx, p, ps: QueueDisplayView(ctx, page=p, page_size=ps)
+        self.add_item(QueuePageButton("⬅️ Forrige", ctx, page - 1, page_size, disabled=page == 0,       row=0, embed_fn=_queue_display_embed, view_fn=nav))
+        self.add_item(QueuePageIndicator(page=page + 1, total_pages=total_pages))
+        self.add_item(QueuePageButton("Neste ➡️",   ctx, page + 1, page_size, disabled=page >= total_pages - 1, row=0, embed_fn=_queue_display_embed, view_fn=nav))
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.delete()
+            except discord.NotFound:
+                pass
+
+    @discord.ui.button(label="Lukk", style=discord.ButtonStyle.secondary, row=0)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message(":x: Bare personen som ba om listen kan lukke den.", ephemeral=True)
+            return
+        await interaction.message.delete()
 
 
 class SongView(discord.ui.View):
@@ -536,14 +577,18 @@ class SongView(discord.ui.View):
     async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         ctx = self.ctx
-
         guild_queue = get_guild_queue(ctx.guild.id)
         if not guild_queue:
             await ctx.send("\U0001F500 Køen er tom.", delete_after=3)
             return
-        description = "\n".join([f"{idx + 1}. {track.title}" for idx, track in enumerate(guild_queue)])
-        embed = discord.Embed(title="🎶 Musikk-kø", description=description, color=discord.Color.blue())
-        await ctx.send(embed=embed, delete_after=10)
+        page_size = 20
+        total_pages = _queue_page_count(len(guild_queue), page_size)
+        view = QueueDisplayView(ctx, page=0, page_size=page_size)
+        msg = await interaction.followup.send(
+            embed=_queue_display_embed(guild_queue, 0, page_size, total_pages),
+            view=view
+        )
+        view.message = msg
 
     @discord.ui.button(emoji='❌')
     async def remove_queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -586,7 +631,8 @@ async def show_now_playing(song, ctx):
     song_embed.add_field(name="Requested by", value=requester.name, inline=True)
     song_embed.add_field(name="Songs in queue", value=f"{len(guild_queue)}", inline=True)
 
-    progress_bar = generate_progress_bar(0, duration)
+    is_stream = getattr(song, 'is_stream', False)
+    progress_bar = generate_progress_bar(0, duration, is_stream=is_stream)
     song_embed.add_field(name="Progress", value=progress_bar, inline=False)
 
     view = SongView(song, ctx)
@@ -609,7 +655,9 @@ async def show_now_playing(song, ctx):
     await bot.change_presence(activity=discord.Game(name=f"🎵 {title}"))
 
 
-def generate_progress_bar(current, total, length=22):
+def generate_progress_bar(current, total, length=22, is_stream=False):
+    if is_stream:
+        return "🔴 LIVE"
     if total == 0:
         return ""
     progress = int((current / total) * length)
@@ -667,7 +715,8 @@ async def update_progress_loop(guild_id, original_song, embed_id):
 
         # YouTube thumbnail hvis mulig
         thumbnail = f"https://img.youtube.com/vi/{current_song.identifier}/hqdefault.jpg" if hasattr(current_song, 'identifier') else None
-        progress = generate_progress_bar(elapsed, duration)
+        is_stream = getattr(current_song, 'is_stream', False)
+        progress = generate_progress_bar(elapsed, duration, is_stream=is_stream)
 
         new_embed = discord.Embed(
             title=getattr(current_song, 'title', 'Ukjent sang'),
@@ -711,6 +760,9 @@ async def play_next(ctx):
             await ctx.message.delete(delay=1)
         except Exception:
             pass
+
+
+focus_stream_url = "https://youtu.be/jfKfPfyJRdk"
 
 
 @bot.command(aliases=['PLAY', 'p', 'P'])
@@ -1312,6 +1364,19 @@ async def music(ctx):
     )
     embed_gather.set_footer(text="Music bot by Mus❤️ Enjoy.")
     await ctx.send(embed=embed_gather)
+
+
+@bot.command(aliases=['fokus', 'study'])
+async def focus(ctx):
+    await play(ctx, query=focus_stream_url)
+
+
+@bot.command(aliases=['setstudyurl', 'setfocus'])
+async def setstudy(ctx, *, url: str):
+    global focus_stream_url
+    focus_stream_url = url.strip()
+    await ctx.send(f"✅ Focus-stream oppdatert til: {focus_stream_url}", delete_after=8)
+    await ctx.message.delete(delay=1)
 
 
 @bot.command(aliases=['inv', 'discord', 'disc', 'link'])
